@@ -136,8 +136,8 @@ def create_feather_mask(size, overlap):
 def init_pipeline(version, mode, device, dtype, alt_vae="none"):
     suffix = ""
     if version == "1.1":
-        suffix = "-1.1"
-    model_downlod(name="JunhaoZhuang/FlashVSR"+suffix)
+        suffix = "-v1.1"
+    model_downlod(model_name="JunhaoZhuang/FlashVSR"+suffix)
     model_path = os.path.join(folder_paths.models_dir, "FlashVSR"+suffix)
     if not os.path.exists(model_path):
         raise RuntimeError(f'Model directory does not exist!\nPlease save all weights to "{model_path}"')
