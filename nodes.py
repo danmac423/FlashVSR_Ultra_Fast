@@ -33,7 +33,7 @@ def log(message:str, message_type:str='normal'):
     print(f"{message}")
 
 def model_downlod(model_name="JunhaoZhuang/FlashVSR"):
-    model_dir = os.path.join(folder_paths.models_dir, "FlashVSR")
+    model_dir = os.path.join(folder_paths.models_dir, model_name.split("/")[-1])
     if not os.path.exists(model_dir):
         log(f"Downloading model '{model_name}' from huggingface...", message_type='info')
         snapshot_download(repo_id=model_name, local_dir=model_dir, local_dir_use_symlinks=False, resume_download=True)
