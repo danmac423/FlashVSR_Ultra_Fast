@@ -124,34 +124,61 @@ def calculate_tile_coords(height, width, tile_size, overlap):
             y1 = r * stride
             x1 = c * stride
 
-            y2 = min(y1 + tile_size, height)
-            x2 = min(x1 + tile_size, width)
-
-            if y2 - y1 < tile_size:
-                y1 = max(0, y2 - tile_size)
-            if x2 - x1 < tile_size:
-                x1 = max(0, x2 - tile_size)
+            y2 = y1 + tile_size
+            x2 = x1 + tile_size
 
             coords.append((x1, y1, x2, y2))
 
     return coords
 
 
-def create_feather_mask(size, overlap):
+def pad_tile(tile, target_h, target_w):
+    """Dodaje padding do kafelka jeśli jest za mały"""
+    N, H, W, C = tile.shape
+    
+    if H >= target_h and W >= target_w:
+        return tile
+    
+    pad_h = max(0, target_h - H)
+    pad_w = max(0, target_w - W)
+    
+    padded = F.pad(tile.permute(0, 3, 1, 2), (0, pad_w, 0, pad_h), mode="replicate")
+    return padded.permute(0, 2, 3, 1)
+
+
+def create_feather_mask_adaptive(size, overlap, actual_overlap_left, actual_overlap_top, actual_overlap_right, actual_overlap_bottom):
+    """Tworzy maskę feather z adaptacyjnym overlapem dla każdej krawędzi"""
     H, W = size
     mask = torch.ones(1, 1, H, W)
-    ramp = torch.linspace(0, 1, overlap)
-
-    mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp.view(1, 1, 1, -1))
-    mask[:, :, :, -overlap:] = torch.minimum(
-        mask[:, :, :, -overlap:], ramp.flip(0).view(1, 1, 1, -1)
-    )
-
-    mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp.view(1, 1, -1, 1))
-    mask[:, :, -overlap:, :] = torch.minimum(
-        mask[:, :, -overlap:, :], ramp.flip(0).view(1, 1, -1, 1)
-    )
-
+    
+    # Lewa krawędź
+    if actual_overlap_left > 0:
+        ramp = torch.linspace(0, 1, actual_overlap_left)
+        mask[:, :, :, :actual_overlap_left] = torch.minimum(
+            mask[:, :, :, :actual_overlap_left], ramp.view(1, 1, 1, -1)
+        )
+    
+    # Prawa krawędź
+    if actual_overlap_right > 0:
+        ramp = torch.linspace(1, 0, actual_overlap_right)
+        mask[:, :, :, -actual_overlap_right:] = torch.minimum(
+            mask[:, :, :, -actual_overlap_right:], ramp.view(1, 1, 1, -1)
+        )
+    
+    # Górna krawędź
+    if actual_overlap_top > 0:
+        ramp = torch.linspace(0, 1, actual_overlap_top)
+        mask[:, :, :actual_overlap_top, :] = torch.minimum(
+            mask[:, :, :actual_overlap_top, :], ramp.view(1, 1, -1, 1)
+        )
+    
+    # Dolna krawędź
+    if actual_overlap_bottom > 0:
+        ramp = torch.linspace(1, 0, actual_overlap_bottom)
+        mask[:, :, -actual_overlap_bottom:, :] = torch.minimum(
+            mask[:, :, -actual_overlap_bottom:, :], ramp.view(1, 1, -1, 1)
+        )
+    
     return mask
 
 
@@ -270,7 +297,18 @@ def flashvsr(
                 f"[FlashVSR] Processing tile {i + 1}/{len(tile_coords)}: coords ({x1},{y1}) to ({x2},{y2})",
                 message_type="info",
             )
-            input_tile = _frames[:, y1:y2, x1:x2, :]
+            
+            # Oblicz rzeczywiste współrzędne z uwzględnieniem granic
+            actual_y1 = max(0, y1)
+            actual_x1 = max(0, x1)
+            actual_y2 = min(H, y2)
+            actual_x2 = min(W, x2)
+            
+            # Wytnij kafelek z oryginalnych ramek
+            input_tile = _frames[:, actual_y1:actual_y2, actual_x1:actual_x2, :]
+            
+            # Dodaj padding jeśli kafelek jest za mały
+            input_tile = pad_tile(input_tile, tile_size, tile_size)
 
             LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
             if not isinstance(pipe, FlashVSRTinyLongPipeline):
@@ -299,15 +337,40 @@ def flashvsr(
 
             processed_tile_cpu = tensor2video(output_tile_gpu).to("cpu")
 
-            mask_nchw = create_feather_mask(
-                (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]), tile_overlap * scale
+            # Oblicz rzeczywiste wymiary wyjściowe (bez paddingu)
+            actual_tile_h = actual_y2 - actual_y1
+            actual_tile_w = actual_x2 - actual_x1
+            
+            # Przytnij wyjście do rzeczywistych wymiarów
+            processed_tile_cpu = processed_tile_cpu[:, :actual_tile_h * scale, :actual_tile_w * scale, :]
+
+            # Oblicz rzeczywisty overlap dla każdej krawędzi
+            overlap_left = (actual_x1 - x1) if x1 < 0 else min(tile_overlap, actual_x1)
+            overlap_top = (actual_y1 - y1) if y1 < 0 else min(tile_overlap, actual_y1)
+            overlap_right = min(tile_overlap, W - actual_x2) if actual_x2 < W else 0
+            overlap_bottom = min(tile_overlap, H - actual_y2) if actual_y2 < H else 0
+            
+            # Skaluj overlap dla wyjściowego rozmiaru
+            overlap_left_scaled = overlap_left * scale
+            overlap_top_scaled = overlap_top * scale
+            overlap_right_scaled = overlap_right * scale
+            overlap_bottom_scaled = overlap_bottom * scale
+
+            mask_nchw = create_feather_mask_adaptive(
+                (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
+                tile_overlap * scale,
+                overlap_left_scaled,
+                overlap_top_scaled,
+                overlap_right_scaled,
+                overlap_bottom_scaled
             ).to("cpu")
             mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
-            out_x1, out_y1 = x1 * scale, y1 * scale
-
+            
+            out_x1, out_y1 = actual_x1 * scale, actual_y1 * scale
             tile_H_scaled = processed_tile_cpu.shape[1]
             tile_W_scaled = processed_tile_cpu.shape[2]
             out_x2, out_y2 = out_x1 + tile_W_scaled, out_y1 + tile_H_scaled
+            
             final_output_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += (
                 processed_tile_cpu * mask_nhwc
             )
@@ -374,7 +437,7 @@ def main():
     unload_dit = False
     seed = 0
 
-    decoder = VideoDecoder("inputs/example0.mp4", dimension_order="NHWC")
+    decoder = VideoDecoder("test_output.mp4", dimension_order="NHWC")
     frames = decoder[:].float() / 255.0
 
     wan_video_dit.USE_BLOCK_ATTN = False
