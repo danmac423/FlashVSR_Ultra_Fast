@@ -17,3 +17,8 @@ dependencies = [
     "triton>=3.5.1 ; sys_platform != 'win32'",
     "triton-windows>=3.5.1.post22 ; sys_platform == 'win32'",
 ]
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
+]
