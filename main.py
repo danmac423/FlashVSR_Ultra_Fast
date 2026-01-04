@@ -135,116 +135,117 @@ def calculate_tile_coords(height, width, tile_size, overlap):
 def pad_tile(tile, target_h, target_w):
     """Dodaje padding do kafelka jeśli jest za mały"""
     N, H, W, C = tile.shape
-    
+
     if H >= target_h and W >= target_w:
         return tile
-    
+
     pad_h = max(0, target_h - H)
     pad_w = max(0, target_w - W)
-    
+
     padded = F.pad(tile.permute(0, 3, 1, 2), (0, pad_w, 0, pad_h), mode="replicate")
     return padded.permute(0, 2, 3, 1)
 
 
-def create_feather_mask_adaptive(size, overlap, actual_overlap_left, actual_overlap_top, actual_overlap_right, actual_overlap_bottom):
+def create_feather_mask_adaptive(
+    size,
+    overlap,
+    actual_overlap_left,
+    actual_overlap_top,
+    actual_overlap_right,
+    actual_overlap_bottom,
+):
     """Tworzy maskę feather z adaptacyjnym overlapem dla każdej krawędzi"""
     H, W = size
     mask = torch.ones(1, 1, H, W)
-    
+
     # Lewa krawędź
     if actual_overlap_left > 0:
         ramp = torch.linspace(0, 1, actual_overlap_left)
         mask[:, :, :, :actual_overlap_left] = torch.minimum(
             mask[:, :, :, :actual_overlap_left], ramp.view(1, 1, 1, -1)
         )
-    
+
     # Prawa krawędź
     if actual_overlap_right > 0:
         ramp = torch.linspace(1, 0, actual_overlap_right)
         mask[:, :, :, -actual_overlap_right:] = torch.minimum(
             mask[:, :, :, -actual_overlap_right:], ramp.view(1, 1, 1, -1)
         )
-    
+
     # Górna krawędź
     if actual_overlap_top > 0:
         ramp = torch.linspace(0, 1, actual_overlap_top)
         mask[:, :, :actual_overlap_top, :] = torch.minimum(
             mask[:, :, :actual_overlap_top, :], ramp.view(1, 1, -1, 1)
         )
-    
+
     # Dolna krawędź
     if actual_overlap_bottom > 0:
         ramp = torch.linspace(1, 0, actual_overlap_bottom)
         mask[:, :, -actual_overlap_bottom:, :] = torch.minimum(
             mask[:, :, -actual_overlap_bottom:, :], ramp.view(1, 1, -1, 1)
         )
-    
+
     return mask
 
 
-def init_pipeline(model, mode, device, dtype, alt_vae="none"):
+def init_pipeline(model: str, device: torch.device, dtype: torch.dtype) -> FlashVSRTinyPipeline:
+    """Initialize FlashVSR pipeline with given model and device.
+    
+    Args:
+        model (str): Model name.
+        device (torch.device): Device to load the model on.
+        dtype (torch.dtype): Data type for model weights.
+        
+    Returns: FlashVSRTinyPipeline: Initialized pipeline instance.
+
+    Raises:
+        RuntimeError: If model directory or required files do not exist.
+    """
     model_path = os.path.join("models", model)
     if not os.path.exists(model_path):
         raise RuntimeError(
             f'Model directory does not exist!\nPlease save all weights to "{model_path}"'
         )
+
     ckpt_path = os.path.join(model_path, "diffusion_pytorch_model_streaming_dmd.safetensors")
     if not os.path.exists(ckpt_path):
         raise RuntimeError(
             f'"diffusion_pytorch_model_streaming_dmd.safetensors" does not exist!\nPlease save it to "{model_path}"'
         )
-    if alt_vae != "none":
-        vae_path = os.path.join(model_path, alt_vae)
-        if not os.path.exists(vae_path):
-            raise RuntimeError(f'"{alt_vae}" does not exist!')
-    else:
-        vae_path = os.path.join(model_path, "Wan2.1_VAE.pth")
-        if not os.path.exists(vae_path):
-            raise RuntimeError(
-                f'"Wan2.1_VAE.pth" does not exist!\nPlease save it to "{model_path}"'
-            )
+
     lq_path = os.path.join(model_path, "LQ_proj_in.ckpt")
     if not os.path.exists(lq_path):
         raise RuntimeError(f'"LQ_proj_in.ckpt" does not exist!\nPlease save it to "{model_path}"')
+
     tcd_path = os.path.join(model_path, "TCDecoder.ckpt")
     if not os.path.exists(tcd_path):
         raise RuntimeError(f'"TCDecoder.ckpt" does not exist!\nPlease save it to "{model_path}"')
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
     prompt_path = os.path.join(current_dir, "posi_prompt.pth")
+    if not os.path.exists(prompt_path):
+        raise RuntimeError(f'"posi_prompt.pth" does not exist!\nPlease save it to "{model_path}"')
 
     mm = ModelManager(torch_dtype=dtype, device="cpu")
-    if mode == "full":
-        mm.load_models([ckpt_path, vae_path])
-        pipe = FlashVSRFullPipeline.from_model_manager(mm, device=device)
-        pipe.vae.model.encoder = None
-        pipe.vae.model.conv1 = None
-    else:
-        mm.load_models([ckpt_path])
-        if mode == "tiny":
-            pipe = FlashVSRTinyPipeline.from_model_manager(mm, device=device)
-        else:
-            pipe = FlashVSRTinyLongPipeline.from_model_manager(mm, device=device)
-        multi_scale_channels = [512, 256, 128, 128]
-        pipe.TCDecoder = build_tcdecoder(
-            new_channels=multi_scale_channels,
-            device=device,
-            dtype=dtype,
-            new_latent_channels=16 + 768,
-        )
-        mis = pipe.TCDecoder.load_state_dict(
-            torch.load(tcd_path, map_location=device), strict=False
-        )
-        pipe.TCDecoder.clean_mem()
 
-    if model == "FlashVSR":
-        pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(
-            in_dim=3, out_dim=1536, layer_num=1
-        ).to(device, dtype=dtype)
-    else:
-        pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(
-            in_dim=3, out_dim=1536, layer_num=1
-        ).to(device, dtype=dtype)
+    mm.load_models([ckpt_path])
+
+    pipe = FlashVSRTinyPipeline.from_model_manager(mm, device=device)
+
+    multi_scale_channels = [512, 256, 128, 128]
+    pipe.TCDecoder = build_tcdecoder(
+        new_channels=multi_scale_channels,
+        device=device,
+        dtype=dtype,
+        new_latent_channels=16 + 768,
+    )
+    pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device), strict=False)
+    pipe.TCDecoder.clean_mem()
+
+    pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(
+        device, dtype=dtype
+    )
     pipe.denoising_model().LQ_proj_in.load_state_dict(
         torch.load(lq_path, map_location="cpu"), strict=True
     )
@@ -252,7 +253,7 @@ def init_pipeline(model, mode, device, dtype, alt_vae="none"):
     pipe.to(device, dtype=dtype)
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
     pipe.init_cross_kv(prompt_path=prompt_path)
-    pipe.load_models_to_device(["dit", "vae"])
+    pipe.load_models_to_device(["dit"])
     pipe.offload_model()
 
     return pipe
@@ -297,16 +298,16 @@ def flashvsr(
                 f"[FlashVSR] Processing tile {i + 1}/{len(tile_coords)}: coords ({x1},{y1}) to ({x2},{y2})",
                 message_type="info",
             )
-            
+
             # Oblicz rzeczywiste współrzędne z uwzględnieniem granic
             actual_y1 = max(0, y1)
             actual_x1 = max(0, x1)
             actual_y2 = min(H, y2)
             actual_x2 = min(W, x2)
-            
+
             # Wytnij kafelek z oryginalnych ramek
             input_tile = _frames[:, actual_y1:actual_y2, actual_x1:actual_x2, :]
-            
+
             # Dodaj padding jeśli kafelek jest za mały
             input_tile = pad_tile(input_tile, tile_size, tile_size)
 
@@ -340,16 +341,18 @@ def flashvsr(
             # Oblicz rzeczywiste wymiary wyjściowe (bez paddingu)
             actual_tile_h = actual_y2 - actual_y1
             actual_tile_w = actual_x2 - actual_x1
-            
+
             # Przytnij wyjście do rzeczywistych wymiarów
-            processed_tile_cpu = processed_tile_cpu[:, :actual_tile_h * scale, :actual_tile_w * scale, :]
+            processed_tile_cpu = processed_tile_cpu[
+                :, : actual_tile_h * scale, : actual_tile_w * scale, :
+            ]
 
             # Oblicz rzeczywisty overlap dla każdej krawędzi
             overlap_left = (actual_x1 - x1) if x1 < 0 else min(tile_overlap, actual_x1)
             overlap_top = (actual_y1 - y1) if y1 < 0 else min(tile_overlap, actual_y1)
             overlap_right = min(tile_overlap, W - actual_x2) if actual_x2 < W else 0
             overlap_bottom = min(tile_overlap, H - actual_y2) if actual_y2 < H else 0
-            
+
             # Skaluj overlap dla wyjściowego rozmiaru
             overlap_left_scaled = overlap_left * scale
             overlap_top_scaled = overlap_top * scale
@@ -362,15 +365,15 @@ def flashvsr(
                 overlap_left_scaled,
                 overlap_top_scaled,
                 overlap_right_scaled,
-                overlap_bottom_scaled
+                overlap_bottom_scaled,
             ).to("cpu")
             mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
-            
+
             out_x1, out_y1 = actual_x1 * scale, actual_y1 * scale
             tile_H_scaled = processed_tile_cpu.shape[1]
             tile_W_scaled = processed_tile_cpu.shape[2]
             out_x2, out_y2 = out_x1 + tile_W_scaled, out_y1 + tile_H_scaled
-            
+
             final_output_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += (
                 processed_tile_cpu * mask_nhwc
             )
@@ -430,14 +433,15 @@ def flashvsr(
 
 def main():
     model = "FlashVSR-v1.1"
-    mode = "tiny"  # full / tiny / tiny-long
-    scale = 2
+    scale = 4
     tiled_vae = True
     tiled_dit = True
     unload_dit = False
     seed = 0
 
-    decoder = VideoDecoder("test_output.mp4", dimension_order="NHWC")
+    video_path = "../videolq_videos/000.mp4"
+
+    decoder = VideoDecoder(video_path, dimension_order="NHWC")
     frames = decoder[:].float() / 255.0
 
     wan_video_dit.USE_BLOCK_ATTN = False
@@ -451,7 +455,7 @@ def main():
     if _device == "auto" or _device not in device_choices:
         raise RuntimeError("No devices found to run FlashVSR!")
 
-    pipe = init_pipeline(model, mode, _device, torch.float16)
+    pipe = init_pipeline(model, _device, torch.float16)
     output = flashvsr(
         pipe=pipe,
         frames=frames,
@@ -459,7 +463,7 @@ def main():
         color_fix=True,
         tiled_vae=tiled_vae,
         tiled_dit=tiled_dit,
-        tile_size=256,
+        tile_size=128,
         tile_overlap=24,
         unload_dit=unload_dit,
         sparse_ratio=2.0,
@@ -469,8 +473,16 @@ def main():
         force_offload=True,
     )
 
-    encoder = VideoEncoder(output.permute(0, 3, 1, 2).clamp(0, 1).mul(255).byte(), frame_rate=30)
-    encoder.to_file("output_000.mp4")
+    encoder = VideoEncoder(output.permute(0, 3, 1, 2).mul(255).byte(), frame_rate=25)
+    encoder.to_file(
+        f"{os.path.splitext(os.path.basename(video_path))[0]}_out.mp4",
+        codec="libx264",
+        crf=0,
+        pixel_format="yuv420p",
+    )
+
+
+
 
 
 if __name__ == "__main__":
