@@ -2,23 +2,19 @@
 # -*- coding: utf-8 -*-
 
 
-import gc
 import math
 import os
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from huggingface_hub import snapshot_download
 from torchcodec.decoders import VideoDecoder
 from torchcodec.encoders import VideoEncoder
 from tqdm import tqdm
 
-from src import FlashVSRFullPipeline, FlashVSRTinyLongPipeline, FlashVSRTinyPipeline, ModelManager
-from src.models import wan_video_dit
+from src import FlashVSRTinyPipeline, ModelManager
 from src.models.TCDecoder import build_tcdecoder
-from src.models.utils import Buffer_LQ4x_Proj, Causal_LQ4x_Proj, clean_vram, get_device_list
+from src.models.utils import Causal_LQ4x_Proj, clean_vram, get_device_list
 
 device_choices = get_device_list()
 
@@ -57,12 +53,13 @@ def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: i
         raise ValueError("invalid original size")
 
     sW, sH = w0 * scale, h0 * scale
-    tW = max(multiple, (sW // multiple) * multiple)
-    tH = max(multiple, (sH // multiple) * multiple)
+    # Round UP to next multiple to avoid cropping
+    tW = ((sW + multiple - 1) // multiple) * multiple
+    tH = ((sH + multiple - 1) // multiple) * multiple
     return sW, sH, tW, tH
 
 
-def tensor_upscale_then_center_crop(
+def tensor_upscale_then_pad(
     frame_tensor: torch.Tensor, scale: int, tW: int, tH: int
 ) -> torch.Tensor:
     h0, w0, c = frame_tensor.shape
@@ -71,11 +68,22 @@ def tensor_upscale_then_center_crop(
     sW, sH = w0 * scale, h0 * scale
     upscaled_tensor = F.interpolate(tensor_bchw, size=(sH, sW), mode="bicubic", align_corners=False)
 
-    l = max(0, (sW - tW) // 2)
-    t = max(0, (sH - tH) // 2)
-    cropped_tensor = upscaled_tensor[:, :, t : t + tH, l : l + tW]
+    # Pad instead of crop
+    pad_w = tW - sW
+    pad_h = tH - sH
 
-    return cropped_tensor.squeeze(0)
+    # Symmetric padding (split difference on both sides)
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+
+    # F.pad uses (left, right, top, bottom) for last 2 dimensions
+    padded_tensor = F.pad(
+        upscaled_tensor, (pad_left, pad_right, pad_top, pad_bottom), mode="replicate"
+    )
+
+    return padded_tensor.squeeze(0)
 
 
 def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16):
@@ -94,9 +102,7 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
         frame_idx = min(i, N0 - 1)
         frame_slice = image_tensor[frame_idx].to(device)
         tensor_chw = (
-            tensor_upscale_then_center_crop(frame_slice, scale=scale, tW=tW, tH=tH)
-            .to("cpu")
-            .to(dtype)
+            tensor_upscale_then_pad(frame_slice, scale=scale, tW=tW, tH=tH).to("cpu").to(dtype)
             * 2.0
             - 1.0
         )
@@ -124,79 +130,45 @@ def calculate_tile_coords(height, width, tile_size, overlap):
             y1 = r * stride
             x1 = c * stride
 
-            y2 = y1 + tile_size
-            x2 = x1 + tile_size
+            y2 = min(y1 + tile_size, height)
+            x2 = min(x1 + tile_size, width)
+
+            if y2 - y1 < tile_size:
+                y1 = max(0, y2 - tile_size)
+            if x2 - x1 < tile_size:
+                x1 = max(0, x2 - tile_size)
 
             coords.append((x1, y1, x2, y2))
 
     return coords
 
 
-def pad_tile(tile, target_h, target_w):
-    """Dodaje padding do kafelka jeśli jest za mały"""
-    N, H, W, C = tile.shape
-
-    if H >= target_h and W >= target_w:
-        return tile
-
-    pad_h = max(0, target_h - H)
-    pad_w = max(0, target_w - W)
-
-    padded = F.pad(tile.permute(0, 3, 1, 2), (0, pad_w, 0, pad_h), mode="replicate")
-    return padded.permute(0, 2, 3, 1)
-
-
-def create_feather_mask_adaptive(
-    size,
-    overlap,
-    actual_overlap_left,
-    actual_overlap_top,
-    actual_overlap_right,
-    actual_overlap_bottom,
-):
-    """Tworzy maskę feather z adaptacyjnym overlapem dla każdej krawędzi"""
+def create_feather_mask(size, overlap):
     H, W = size
     mask = torch.ones(1, 1, H, W)
+    ramp = torch.linspace(0, 1, overlap)
 
-    # Lewa krawędź
-    if actual_overlap_left > 0:
-        ramp = torch.linspace(0, 1, actual_overlap_left)
-        mask[:, :, :, :actual_overlap_left] = torch.minimum(
-            mask[:, :, :, :actual_overlap_left], ramp.view(1, 1, 1, -1)
-        )
+    mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp.view(1, 1, 1, -1))
+    mask[:, :, :, -overlap:] = torch.minimum(
+        mask[:, :, :, -overlap:], ramp.flip(0).view(1, 1, 1, -1)
+    )
 
-    # Prawa krawędź
-    if actual_overlap_right > 0:
-        ramp = torch.linspace(1, 0, actual_overlap_right)
-        mask[:, :, :, -actual_overlap_right:] = torch.minimum(
-            mask[:, :, :, -actual_overlap_right:], ramp.view(1, 1, 1, -1)
-        )
-
-    # Górna krawędź
-    if actual_overlap_top > 0:
-        ramp = torch.linspace(0, 1, actual_overlap_top)
-        mask[:, :, :actual_overlap_top, :] = torch.minimum(
-            mask[:, :, :actual_overlap_top, :], ramp.view(1, 1, -1, 1)
-        )
-
-    # Dolna krawędź
-    if actual_overlap_bottom > 0:
-        ramp = torch.linspace(1, 0, actual_overlap_bottom)
-        mask[:, :, -actual_overlap_bottom:, :] = torch.minimum(
-            mask[:, :, -actual_overlap_bottom:, :], ramp.view(1, 1, -1, 1)
-        )
+    mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp.view(1, 1, -1, 1))
+    mask[:, :, -overlap:, :] = torch.minimum(
+        mask[:, :, -overlap:, :], ramp.flip(0).view(1, 1, -1, 1)
+    )
 
     return mask
 
 
 def init_pipeline(model: str, device: torch.device, dtype: torch.dtype) -> FlashVSRTinyPipeline:
     """Initialize FlashVSR pipeline with given model and device.
-    
+
     Args:
         model (str): Model name.
         device (torch.device): Device to load the model on.
         dtype (torch.dtype): Data type for model weights.
-        
+
     Returns: FlashVSRTinyPipeline: Initialized pipeline instance.
 
     Raises:
@@ -299,21 +271,12 @@ def flashvsr(
                 message_type="info",
             )
 
-            # Oblicz rzeczywiste współrzędne z uwzględnieniem granic
-            actual_y1 = max(0, y1)
-            actual_x1 = max(0, x1)
-            actual_y2 = min(H, y2)
-            actual_x2 = min(W, x2)
-
-            # Wytnij kafelek z oryginalnych ramek
-            input_tile = _frames[:, actual_y1:actual_y2, actual_x1:actual_x2, :]
-
-            # Dodaj padding jeśli kafelek jest za mały
-            input_tile = pad_tile(input_tile, tile_size, tile_size)
+            input_tile = _frames[:, y1:y2, x1:x2, :]
+            input_tile_h = y2 - y1
+            input_tile_w = x2 - x1
 
             LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
-            if not isinstance(pipe, FlashVSRTinyLongPipeline):
-                LQ_tile = LQ_tile.to(_device)
+            LQ_tile = LQ_tile.to(_device)
 
             output_tile_gpu = pipe(
                 prompt="",
@@ -338,42 +301,27 @@ def flashvsr(
 
             processed_tile_cpu = tensor2video(output_tile_gpu).to("cpu")
 
-            # Oblicz rzeczywiste wymiary wyjściowe (bez paddingu)
-            actual_tile_h = actual_y2 - actual_y1
-            actual_tile_w = actual_x2 - actual_x1
+            exact_tile_h = input_tile_h * scale
+            exact_tile_w = input_tile_w * scale
 
-            # Przytnij wyjście do rzeczywistych wymiarów
+            pad_h = th - exact_tile_h
+            pad_w = tw - exact_tile_w
+
+            crop_top = pad_h // 2
+            crop_bottom = crop_top + exact_tile_h
+            crop_left = pad_w // 2
+            crop_right = crop_left + exact_tile_w
             processed_tile_cpu = processed_tile_cpu[
-                :, : actual_tile_h * scale, : actual_tile_w * scale, :
+                :, crop_top:crop_bottom, crop_left:crop_right, :
             ]
-
-            # Oblicz rzeczywisty overlap dla każdej krawędzi
-            overlap_left = (actual_x1 - x1) if x1 < 0 else min(tile_overlap, actual_x1)
-            overlap_top = (actual_y1 - y1) if y1 < 0 else min(tile_overlap, actual_y1)
-            overlap_right = min(tile_overlap, W - actual_x2) if actual_x2 < W else 0
-            overlap_bottom = min(tile_overlap, H - actual_y2) if actual_y2 < H else 0
-
-            # Skaluj overlap dla wyjściowego rozmiaru
-            overlap_left_scaled = overlap_left * scale
-            overlap_top_scaled = overlap_top * scale
-            overlap_right_scaled = overlap_right * scale
-            overlap_bottom_scaled = overlap_bottom * scale
-
-            mask_nchw = create_feather_mask_adaptive(
-                (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
-                tile_overlap * scale,
-                overlap_left_scaled,
-                overlap_top_scaled,
-                overlap_right_scaled,
-                overlap_bottom_scaled,
+            mask_nchw = create_feather_mask(
+                (exact_tile_h, exact_tile_w), tile_overlap * scale
             ).to("cpu")
             mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
 
-            out_x1, out_y1 = actual_x1 * scale, actual_y1 * scale
-            tile_H_scaled = processed_tile_cpu.shape[1]
-            tile_W_scaled = processed_tile_cpu.shape[2]
-            out_x2, out_y2 = out_x1 + tile_W_scaled, out_y1 + tile_H_scaled
-
+            out_x1, out_y1 = x1 * scale, y1 * scale
+            out_x2, out_y2 = out_x1 + exact_tile_w, out_y1 + exact_tile_h
+            
             final_output_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += (
                 processed_tile_cpu * mask_nhwc
             )
@@ -387,8 +335,7 @@ def flashvsr(
     else:
         log("[FlashVSR] Preparing frames...")
         LQ, th, tw, F = prepare_input_tensor(_frames, _device, scale=scale, dtype=dtype)
-        if not isinstance(pipe, FlashVSRTinyLongPipeline):
-            LQ = LQ.to(_device)
+        LQ = LQ.to(_device)
         log(f"[FlashVSR] Processing {frames.shape[0]} frames...", message_type="info")
 
         video = pipe(
@@ -436,7 +383,7 @@ def main():
     scale = 4
     tiled_vae = True
     tiled_dit = True
-    unload_dit = False
+    unload_dit = True
     seed = 0
 
     video_path = "../videolq_videos/000.mp4"
@@ -444,7 +391,6 @@ def main():
     decoder = VideoDecoder(video_path, dimension_order="NHWC")
     frames = decoder[:].float() / 255.0
 
-    wan_video_dit.USE_BLOCK_ATTN = False
     _device = (
         "cuda:0"
         if torch.cuda.is_available()
@@ -463,7 +409,7 @@ def main():
         color_fix=True,
         tiled_vae=tiled_vae,
         tiled_dit=tiled_dit,
-        tile_size=128,
+        tile_size=128 + 32 + 32,
         tile_overlap=24,
         unload_dit=unload_dit,
         sparse_ratio=2.0,
@@ -480,9 +426,6 @@ def main():
         crf=0,
         pixel_format="yuv420p",
     )
-
-
-
 
 
 if __name__ == "__main__":

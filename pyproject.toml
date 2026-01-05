@@ -16,4 +16,17 @@ dependencies = [
     "tqdm>=4.67.1",
     "triton>=3.5.1 ; sys_platform != 'win32'",
     "triton-windows>=3.5.1.post22 ; sys_platform == 'win32'",
+    "spas_sage_attn",
+    "sageattention",
 ]
+
+[tool.uv.sources]
+spas_sage_attn = { git = "https://github.com/thu-ml/SpargeAttn.git" }
+sageattention = { git = "https://github.com/thu-ml/SageAttention.git" }
+
+[tool.uv.extra-build-dependencies]
+spas_sage_attn = ["torch", "ninja", "numpy"]
+sageattention = ["torch", "ninja", "numpy"]
+
+[dependency-groups]
+dev = ["jupyter>=1.1.1", "matplotlib>=3.10.8"]
