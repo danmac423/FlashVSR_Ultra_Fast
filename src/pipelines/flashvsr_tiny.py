@@ -348,9 +348,6 @@ class FlashVSRTinyPipeline(BasePipeline):
             num_frames = (num_frames + 2) // 4 * 4 + 1
             print(f"Only `num_frames % 4 != 1` is acceptable. We round it up to {num_frames}.")
 
-        # Tiler 参数
-        tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
-
         # 初始化噪声
         if if_buffer:
             noise = self.generate_noise((1, 16, (num_frames - 1) // 4, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
@@ -438,7 +435,6 @@ class FlashVSRTinyPipeline(BasePipeline):
                 # 更新 latent
                 cur_latents = cur_latents - noise_pred_posi
                 latents_total.append(cur_latents)
-                LQ_pre_idx = LQ_cur_idx
             
             if hasattr(self.dit, "LQ_proj_in"):
                 self.dit.LQ_proj_in.clear_cache()
