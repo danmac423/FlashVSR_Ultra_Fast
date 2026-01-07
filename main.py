@@ -88,7 +88,7 @@ def tensor_upscale_then_pad(
     return padded_tensor.squeeze(0)
 
 
-def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16):
+def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.float16):
     N0, h0, w0, _ = image_tensor.shape
 
     multiple = 128
