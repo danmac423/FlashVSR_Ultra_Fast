@@ -4,14 +4,14 @@
 
 import math
 import os
+from enum import Enum
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from PIL import Image
 from torchcodec.decoders import VideoDecoder
 from torchcodec.encoders import VideoEncoder
+from torchvision.io import write_png
 from tqdm import tqdm
 
 from src import FlashVSRTinyPipeline, ModelManager
@@ -414,22 +414,9 @@ def process_single_temporal_chunk(
     return final_output[: frames_chunk.shape[0], :, :, :]
 
 
-def save_frame_as_png(frame_tensor, output_dir, frame_number):
-    """
-    Save a single frame as PNG file.
-
-    Args:
-        frame_tensor: Single frame tensor (H, W, C) in range [0, 1]
-        output_dir: Directory to save the PNG file
-        frame_number: Frame number for filename
-    """
-    # Convert to numpy and scale to 0-255
-    frame_np = (frame_tensor.cpu().numpy() * 255).astype(np.uint8)
-
-    # Create PIL Image and save
-    img = Image.fromarray(frame_np)
-    output_path = os.path.join(output_dir, f"frame_{frame_number:06d}.png")
-    img.save(output_path)
+class OutputMode(Enum):
+    VIDEO = 1
+    FRAMES = 2
 
 
 def flashvsr(
@@ -439,6 +426,7 @@ def flashvsr(
     output_dir,
     frame_rate,
     scale,
+    output_mode: OutputMode,
     color_fix,
     spatial_tiling,
     spatial_tile_size,
@@ -477,6 +465,8 @@ def flashvsr(
         log(f"[FlashVSR] Created {len(chunks)} temporal chunks", message_type="info")
 
         prev_chunk_tail = None  # Store only the overlapping tail from previous chunk
+
+        frame_counter = 0
 
         for chunk_idx, (start, end) in enumerate(tqdm(chunks, desc="Processing Temporal Chunks")):
             log(
@@ -547,16 +537,33 @@ def flashvsr(
                         else rest_of_chunk
                     )
 
-            encoder = VideoEncoder(
-                frames=(frames_to_write.permute(0, 3, 1, 2).clamp(0, 1) * 255).to(torch.uint8),
-                frame_rate=frame_rate,
-            )
-            encoder.to_file(
-                os.path.join(output_dir, f"chunk_{chunk_idx:03d}.mp4"),
-                codec="libx264",
-                crf=0,
-                pixel_format="yuv420p",
-            )
+            if output_mode == OutputMode.VIDEO:
+                encoder = VideoEncoder(
+                    frames=frames_to_write.permute(0, 3, 1, 2)
+                    .clamp(0, 1)
+                    .mul_(255)
+                    .to(torch.uint8),
+                    frame_rate=frame_rate,
+                )
+                encoder.to_file(
+                    os.path.join(output_dir, f"chunk_{chunk_idx:03d}.mp4"),
+                    codec="libx264",
+                    crf=0,
+                    pixel_format="yuv420p",
+                )
+            elif output_mode == OutputMode.FRAMES:
+                final_output = (
+                    frames_to_write.permute(0, 3, 1, 2).clamp(0, 1).mul_(255).to(torch.uint8)
+                )
+                N = final_output.shape[0]
+                for i in range(N):
+                    frame = final_output[i]
+                    write_png(
+                        frame,
+                        os.path.join(output_dir, f"{frame_counter:08d}.png"),
+                        compression_level=0,
+                    )
+                    frame_counter += 1
 
             log(
                 f"[FlashVSR] Saved chunk {chunk_idx + 1} with {frames_to_write.shape[0]} frames",
@@ -598,22 +605,30 @@ def flashvsr(
             force_offload,
         )
 
-        encoder = VideoEncoder(
-            frames=(final_output.permute(0, 3, 1, 2).clamp(0, 1) * 255).to(torch.uint8),
-            frame_rate=frame_rate,
-        )
-        encoder.to_file(
-            os.path.join(output_dir, "chunk_000.mp4"),
-            codec="libx264",
-            crf=0,
-            pixel_format="yuv420p",
-        )
+        if output_mode == OutputMode.VIDEO:
+            encoder = VideoEncoder(
+                frames=final_output.permute(0, 3, 1, 2).clamp(0, 1).mul_(255).to(torch.uint8),
+                frame_rate=frame_rate,
+            )
+            encoder.to_file(
+                os.path.join(output_dir, "chunk_000.mp4"),
+                codec="libx264",
+                crf=0,
+                pixel_format="yuv420p",
+            )
+        elif output_mode == OutputMode.FRAMES:
+            final_output = final_output.permute(0, 3, 1, 2).clamp(0, 1).mul_(255).to(torch.uint8)
+            N = final_output.shape[0]
+            for i in range(N):
+                frame = final_output[i]
+                write_png(frame, os.path.join(output_dir, f"{i:08d}.png"), compression_level=0)
+
         log("[FlashVSR] Saved final output video.", message_type="info")
 
         del frames, _frames, final_output
         clean_vram()
 
-        log("[FlashVSR] Done.", message_type="info")
+    log("[FlashVSR] Done.", message_type="info")
 
 
 def main():
@@ -630,7 +645,8 @@ def main():
     temporal_tile_size = 100
     temporal_tile_overlap = 4
 
-    video_path = "inputs/example0.mp4"
+    # video_path = "inputs/example0.mp4"
+    video_path = "../train_videos/000.mp4"
 
     decoder = VideoDecoder(video_path, dimension_order="NHWC")
     total_frames = len(decoder)
@@ -660,6 +676,7 @@ def main():
         output_dir=output_dir,
         frame_rate=30,
         scale=scale,
+        output_mode=OutputMode.FRAMES,
         color_fix=True,
         spatial_tiling=spatial_tiling,
         spatial_tile_size=spatial_tile_size,
