@@ -463,7 +463,7 @@ class FlashVSRTinyPipeline(BasePipeline):
             except:
                 pass
 
-        return frames[0]
+        return frames[0] # C N H W
 
 
 # -----------------------------
